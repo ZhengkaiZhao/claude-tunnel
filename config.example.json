@@ -1,0 +1,30 @@
+{
+  "role": "c",
+  "server": {
+    "host": "your-vps.example.com",
+    "port": 22,
+    "user": "root",
+    "password": "",
+    "key_file": null
+  },
+  "tunnel": {
+    "relay_port": 8088,
+    "forward_port": 19001
+  },
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "token": "change-me",
+    "upstream_base_url": "https://api.anthropic.com",
+    "upstream_auth_token": "sk-ant-xxx"
+  },
+  "claude": {
+    "local_port": 50000,
+    "model": "claude-sonnet-4-6",
+    "project_dir": ""
+  },
+  "room": {
+    "name": "default",
+    "token": "change-me"
+  }
+}
