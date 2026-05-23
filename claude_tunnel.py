@@ -127,7 +127,7 @@ def cmd_init_interactive() -> dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SSH helpers (uses SSH_ASKPASS for password automation, no sshpass needed)
+# SSH helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _SSH_PROCS: list[subprocess.Popen] = []
@@ -135,17 +135,32 @@ _ASKPASS_FILES: list[str] = []
 
 IS_WINDOWS = platform.system() == "Windows"
 
+try:
+    import paramiko as _paramiko
+    HAS_PARAMIKO = True
+except ImportError:
+    HAS_PARAMIKO = False
+
 
 def _make_askpass(password: str) -> str:
-    """Write a temp script that echoes the password; return its path."""
+    """Write a temp askpass script that echoes the password.
+    On Windows, SSH_ASKPASS must be an executable (.bat/.exe), not a .sh file.
+    """
     import stat
     import tempfile
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
-        # Shell-escape single quotes in password
+    if IS_WINDOWS:
+        # Windows: .bat file, escape % and special chars
+        safe = password.replace("%", "%%").replace('"', '""')
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".bat", delete=False) as f:
+            f.write(f"@echo off\necho {safe}\n")
+            path = f.name
+    else:
         safe = password.replace("'", "'\\''")
-        f.write(f"#!/bin/sh\necho '{safe}'\n")
-        path = f.name
-    os.chmod(path, stat.S_IRWXU)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+            f.write(f"#!/bin/sh\necho '{safe}'\n")
+            path = f.name
+        import stat as _stat
+        os.chmod(path, _stat.S_IRWXU)
     _ASKPASS_FILES.append(path)
     return path
 
@@ -159,13 +174,30 @@ def _ssh_env(password: str) -> dict[str, str]:
     return env
 
 
+def _has_plink() -> bool:
+    return shutil.which("plink") is not None
+
+
+def _plink_base_args(cfg: dict[str, Any]) -> list[str]:
+    """Build plink (PuTTY) args — used on Windows when plink is available."""
+    srv = cfg["server"]
+    args = ["plink", "-batch"]
+    if srv.get("key_file"):
+        args += ["-i", srv["key_file"]]
+    elif srv.get("password"):
+        args += ["-pw", srv["password"]]
+    if srv.get("port") and srv["port"] != 22:
+        args += ["-P", str(srv["port"])]
+    args.append(f"{srv['user']}@{srv['host']}")
+    return args
+
+
 def _ssh_base_args(cfg: dict[str, Any]) -> list[str]:
     srv = cfg["server"]
     args = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30"]
     if srv.get("key_file"):
         args += ["-i", srv["key_file"]]
     elif srv.get("password"):
-        # Force password auth so SSH doesn't waste attempts on publickey
         args += ["-o", "PubkeyAuthentication=no",
                  "-o", "PreferredAuthentications=keyboard-interactive,password"]
     if srv.get("port") and srv["port"] != 22:
@@ -174,38 +206,123 @@ def _ssh_base_args(cfg: dict[str, Any]) -> list[str]:
     return args
 
 
+def _paramiko_exec(cfg: dict[str, Any], remote_cmd: str) -> tuple[int, str, str]:
+    """Run a remote command via paramiko (pure Python SSH, no external tools)."""
+    srv = cfg["server"]
+    client = _paramiko.SSHClient()
+    client.set_missing_host_key_policy(_paramiko.AutoAddPolicy())
+    connect_kwargs: dict[str, Any] = {
+        "hostname": srv["host"],
+        "port": srv.get("port", 22),
+        "username": srv["user"],
+        "timeout": 30,
+    }
+    if srv.get("key_file"):
+        connect_kwargs["key_filename"] = srv["key_file"]
+    elif srv.get("password"):
+        connect_kwargs["password"] = srv["password"]
+        connect_kwargs["look_for_keys"] = False
+        connect_kwargs["allow_agent"] = False
+    client.connect(**connect_kwargs)
+    _, stdout, stderr = client.exec_command(remote_cmd, timeout=60)
+    exit_code = stdout.channel.recv_exit_status()
+    out = stdout.read().decode(errors="replace")
+    err = stderr.read().decode(errors="replace")
+    client.close()
+    return exit_code, out, err
+
+
+def _paramiko_upload(cfg: dict[str, Any], local_path: str, remote_path: str) -> tuple[int, str]:
+    """Upload a file via paramiko SFTP."""
+    srv = cfg["server"]
+    client = _paramiko.SSHClient()
+    client.set_missing_host_key_policy(_paramiko.AutoAddPolicy())
+    connect_kwargs: dict[str, Any] = {
+        "hostname": srv["host"],
+        "port": srv.get("port", 22),
+        "username": srv["user"],
+        "timeout": 30,
+    }
+    if srv.get("key_file"):
+        connect_kwargs["key_filename"] = srv["key_file"]
+    elif srv.get("password"):
+        connect_kwargs["password"] = srv["password"]
+        connect_kwargs["look_for_keys"] = False
+        connect_kwargs["allow_agent"] = False
+    client.connect(**connect_kwargs)
+    sftp = client.open_sftp()
+    sftp.put(local_path, remote_path)
+    sftp.close()
+    client.close()
+    return 0, ""
+
+
 def ssh_exec(cfg: dict[str, Any], remote_cmd: str) -> tuple[int, str, str]:
-    args = _ssh_base_args(cfg) + [remote_cmd]
+    if HAS_PARAMIKO and cfg["server"].get("password"):
+        try:
+            return _paramiko_exec(cfg, remote_cmd)
+        except Exception as e:
+            return 1, "", str(e)
     password = cfg["server"].get("password", "")
-    env = _ssh_env(password) if password else None
-    proc = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, env=env)
+    if IS_WINDOWS and _has_plink():
+        args = _plink_base_args(cfg) + [remote_cmd]
+        proc = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True)
+    else:
+        args = _ssh_base_args(cfg) + [remote_cmd]
+        env = _ssh_env(password) if password else None
+        proc = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, env=env)
     return proc.returncode, proc.stdout.decode(errors="replace"), proc.stderr.decode(errors="replace")
 
 
 def scp_upload(cfg: dict[str, Any], local_path: str, remote_path: str) -> tuple[int, str]:
-    """Upload a local file to the server via scp."""
+    """Upload a local file to the server via scp / sftp."""
     srv = cfg["server"]
+    password = srv.get("password", "")
+
+    if HAS_PARAMIKO and password:
+        try:
+            return _paramiko_upload(cfg, local_path, remote_path)
+        except Exception as e:
+            return 1, str(e)
+
+    if IS_WINDOWS and shutil.which("pscp"):
+        args = ["pscp", "-batch"]
+        if srv.get("key_file"):
+            args += ["-i", srv["key_file"]]
+        elif password:
+            args += ["-pw", password]
+        if srv.get("port") and srv["port"] != 22:
+            args += ["-P", str(srv["port"])]
+        args += [local_path, f"{srv['user']}@{srv['host']}:{remote_path}"]
+        proc = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True)
+        return proc.returncode, proc.stderr.decode(errors="replace")
+
     args = ["scp", "-o", "StrictHostKeyChecking=accept-new"]
     if srv.get("key_file"):
         args += ["-i", srv["key_file"]]
-    elif srv.get("password"):
+    elif password:
         args += ["-o", "PubkeyAuthentication=no",
                  "-o", "PreferredAuthentications=keyboard-interactive,password"]
     if srv.get("port") and srv["port"] != 22:
         args += ["-P", str(srv["port"])]
     args += [local_path, f"{srv['user']}@{srv['host']}:{remote_path}"]
-    password = srv.get("password", "")
     env = _ssh_env(password) if password else None
     proc = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, env=env)
     return proc.returncode, proc.stderr.decode(errors="replace")
 
 
 def ssh_tunnel_bg(cfg: dict[str, Any], tunnel_flag: str, mapping: str) -> subprocess.Popen:
-    args = _ssh_base_args(cfg)
-    args_insert = ["-o", "ExitOnForwardFailure=yes", "-N", tunnel_flag, mapping]
-    args = args[:1] + args_insert + args[1:]
     password = cfg["server"].get("password", "")
-    env = _ssh_env(password) if password else None
+    if IS_WINDOWS and _has_plink():
+        args = _plink_base_args(cfg)
+        # plink uses -L/-R differently: insert before host
+        args_insert = ["-N", tunnel_flag, mapping]
+        args = args[:-1] + args_insert + [args[-1]]
+    else:
+        args = _ssh_base_args(cfg)
+        args_insert = ["-o", "ExitOnForwardFailure=yes", "-N", tunnel_flag, mapping]
+        args = args[:1] + args_insert + args[1:]
+    env = (_ssh_env(password) if password else None) if not IS_WINDOWS else None
     proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, env=env)
     _SSH_PROCS.append(proc)
     return proc
@@ -788,6 +905,13 @@ signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
 def main() -> int:
     global CONFIG_PATH
+    # On Windows with password auth, paramiko is required for reliable SSH
+    if IS_WINDOWS and not HAS_PARAMIKO:
+        print("[!] Windows detected: install paramiko for password-based SSH support:")
+        print("    pip install paramiko")
+        print("    (SSH key auth works without paramiko)")
+        print()
+
     parser = argparse.ArgumentParser(
         prog="claude-tunnel",
         description="One-command Claude Code remote tunnel tool.",
