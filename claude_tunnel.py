@@ -2,7 +2,8 @@
 """claude-tunnel: One-command Claude Code remote tunnel tool.
 
 Usage:
-    python3 claude_tunnel.py init        # Interactive setup
+    python3 claude_tunnel.py init        # Interactive setup (with env check)
+    python3 claude_tunnel.py check       # Check environment dependencies
     python3 claude_tunnel.py up          # One-key start (deploy + connect)
     python3 claude_tunnel.py down        # Disconnect + cleanup
     python3 claude_tunnel.py status      # Check connection state
@@ -26,16 +27,17 @@ import socket
 import ssl
 import subprocess
 import sys
-import textwrap
 import threading
 import time
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 __version__ = "0.1.0"
+
+# Global stop event for clean Ctrl+C handling
+_stop_event = threading.Event()
 
 CONFIG_PATH = Path.home() / ".claude-tunnel.json"
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -49,7 +51,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "upstream_base_url": "",
         "upstream_auth_token": "",
     },
-    "claude": {"local_port": 50000, "model": "claude-sonnet-4-6", "project_dir": ""},
+    "claude": {"local_port": 50000, "model": "claude-sonnet-4-6", "project_dir": "", "command": ""},
     "room": {"name": "default", "token": "change-me"},
 }
 
@@ -102,6 +104,19 @@ def ask(prompt: str, default: str = "") -> str:
 
 
 def cmd_init_interactive() -> dict[str, Any]:
+    """Run interactive init — delegates to ct_init if rich is available."""
+    try:
+        from ct_init import cmd_init_interactive as _rich_init
+        cfg = _rich_init()
+        if cfg is None:
+            print("  Init cancelled.")
+            sys.exit(0)
+        save_config(cfg)
+        return cfg
+    except ImportError:
+        pass
+
+    # Fallback: simple prompts
     print("\n=== claude-tunnel init ===\n")
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
 
@@ -124,7 +139,6 @@ def cmd_init_interactive() -> dict[str, Any]:
 
     if cfg["role"] == "c":
         print("\n  --- Gateway (C-side) ---")
-        # Auto-read from ~/.claude/settings.json; user can override or leave blank
         claude_env = _load_claude_settings()
         auto_url = claude_env.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
         auto_token = claude_env.get("ANTHROPIC_AUTH_TOKEN", "")
@@ -135,13 +149,13 @@ def cmd_init_interactive() -> dict[str, Any]:
         cfg["gateway"]["token"] = ask("Gateway auth token", "change-me")
         cfg["gateway"]["upstream_base_url"] = ask("Upstream API base URL", auto_url)
         cfg["gateway"]["upstream_auth_token"] = ask("Upstream API key/token (Enter to use local claude settings)", auto_token)
-        # If user left blank, store empty string — c-start will fallback to settings.json at runtime
 
     else:
         print("\n  --- Claude Code (A-side) ---")
         cfg["claude"]["local_port"] = int(ask("Local port for Claude", "50000"))
         cfg["claude"]["model"] = ask("Model", "claude-sonnet-4-6")
         cfg["claude"]["project_dir"] = ask("Project directory", str(Path.cwd()))
+        cfg["claude"]["command"] = ask("Claude command (empty=auto-detect)", "")
         cfg["gateway"]["token"] = ask("Gateway auth token (same as C-side)", "change-me")
 
     save_config(cfg)
@@ -333,18 +347,149 @@ def scp_upload(cfg: dict[str, Any], local_path: str, remote_path: str) -> tuple[
     return proc.returncode, proc.stderr.decode(errors="replace")
 
 
+def _paramiko_tunnel_bg(cfg: dict[str, Any], tunnel_flag: str, mapping: str) -> threading.Thread:
+    """Create an SSH tunnel using paramiko (works without terminal interaction)."""
+    srv = cfg["server"]
+    parts = mapping.split(":")
+    if tunnel_flag == "-L":
+        # -L local_host:local_port:remote_host:remote_port
+        local_host, local_port_s, remote_host, remote_port_s = parts[0], parts[1], parts[2], parts[3]
+        local_port = int(local_port_s)
+        remote_port = int(remote_port_s)
+    else:
+        # -R remote_bind:remote_port:local_host:local_port
+        _remote_bind, remote_port_s, local_host, local_port_s = parts[0], parts[1], parts[2], parts[3]
+        local_port = int(local_port_s)
+        remote_port = int(remote_port_s)
+
+    import paramiko
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    connect_kwargs: dict[str, Any] = {
+        "hostname": srv["host"],
+        "port": int(srv.get("port", 22)),
+        "username": srv.get("user", "root"),
+    }
+    if srv.get("key_file"):
+        connect_kwargs["key_filename"] = srv["key_file"]
+    elif srv.get("password"):
+        connect_kwargs["password"] = srv["password"]
+    client.connect(**connect_kwargs)
+
+    transport = client.get_transport()
+
+    if tunnel_flag == "-L":
+        import socketserver
+
+        class LocalForwardHandler(socketserver.BaseRequestHandler):
+            def handle(self):
+                try:
+                    chan = transport.open_channel("direct-tcpip",
+                                                 (remote_host, remote_port),
+                                                 self.request.getpeername())
+                except Exception:
+                    return
+                if chan is None:
+                    return
+                import select
+                while True:
+                    r, _, _ = select.select([self.request, chan], [], [], 1.0)
+                    if self.request in r:
+                        data = self.request.recv(4096)
+                        if not data:
+                            break
+                        chan.sendall(data)
+                    if chan in r:
+                        data = chan.recv(4096)
+                        if not data:
+                            break
+                        self.request.sendall(data)
+                chan.close()
+                self.request.close()
+
+        class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        server = ThreadedTCPServer((local_host, local_port), LocalForwardHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        t._paramiko_client = client
+        t._paramiko_server = server
+        return t
+    else:
+        transport.request_port_forward("", remote_port)
+        def _accept_loop():
+            while transport.is_active():
+                chan = transport.accept(timeout=1)
+                if chan is None:
+                    continue
+                def _forward(ch):
+                    try:
+                        sock = socket.create_connection((local_host, local_port))
+                    except Exception:
+                        ch.close()
+                        return
+                    import select
+                    while True:
+                        r, _, _ = select.select([sock, ch], [], [], 1.0)
+                        if sock in r:
+                            data = sock.recv(4096)
+                            if not data:
+                                break
+                            ch.sendall(data)
+                        if ch in r:
+                            data = ch.recv(4096)
+                            if not data:
+                                break
+                            sock.sendall(data)
+                    sock.close()
+                    ch.close()
+                threading.Thread(target=_forward, args=(chan,), daemon=True).start()
+        t = threading.Thread(target=_accept_loop, daemon=True)
+        t.start()
+        t._paramiko_client = client
+        return t
+
+
 def ssh_tunnel_bg(cfg: dict[str, Any], tunnel_flag: str, mapping: str) -> subprocess.Popen:
     password = cfg["server"].get("password", "")
+    if HAS_PARAMIKO and password:
+        tunnel_thread = _paramiko_tunnel_bg(cfg, tunnel_flag, mapping)
+        class _FakeProc:
+            """Mimics subprocess.Popen interface for paramiko tunnel."""
+            def __init__(self, thread):
+                self._thread = thread
+                self.returncode = None
+            def poll(self):
+                return None if self._thread.is_alive() else 0
+            def terminate(self):
+                client = getattr(self._thread, '_paramiko_client', None)
+                server = getattr(self._thread, '_paramiko_server', None)
+                if server:
+                    server.shutdown()
+                if client:
+                    client.close()
+            def kill(self):
+                self.terminate()
+            def wait(self, timeout=None):
+                self._thread.join(timeout=timeout)
+                return 0
+        proc = _FakeProc(tunnel_thread)
+        _SSH_PROCS.append(proc)
+        return proc
     if IS_WINDOWS and _has_plink():
         args = _plink_base_args(cfg)
-        # plink uses -L/-R differently: insert before host
         args_insert = ["-N", tunnel_flag, mapping]
         args = args[:-1] + args_insert + [args[-1]]
     else:
         args = _ssh_base_args(cfg)
         args_insert = ["-o", "ExitOnForwardFailure=yes", "-N", tunnel_flag, mapping]
         args = args[:1] + args_insert + args[1:]
-    env = (_ssh_env(password) if password else None) if not IS_WINDOWS else None
+    if password:
+        env = _ssh_env(password)
+    else:
+        env = None
     proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, env=env)
     _SSH_PROCS.append(proc)
     return proc
@@ -396,6 +541,11 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._j(200, {"ok": True, "rooms": len(ROOMS)})
+            return
+        if self.path == "/rooms":
+            with LOCK:
+                data = {name: r.snapshot() for name, r in ROOMS.items()}
+            self._j(200, data)
             return
         self._j(404, {"error": "not found"})
     def do_POST(self):
@@ -694,6 +844,154 @@ def wait_for_port(host: str, port: int, timeout: float = 30) -> bool:
     return False
 
 
+def _find_claude_js_entry() -> str | None:
+    """Find the Claude Code JS entry point, bypassing the native binary."""
+    # Look in npm global prefix
+    npm_cmd = "npm.cmd" if IS_WINDOWS else "npm"
+    if not shutil.which(npm_cmd):
+        return None
+    try:
+        proc = subprocess.run([npm_cmd, "prefix", "-g"], capture_output=True, timeout=10)
+        npm_prefix = proc.stdout.decode(errors="replace").strip()
+    except Exception:
+        return None
+    if not npm_prefix:
+        return None
+
+    pkg_dir = Path(npm_prefix) / "node_modules" / "@anthropic-ai" / "claude-code"
+    if not pkg_dir.exists():
+        return None
+
+    # Read package.json to find the real entry point
+    pkg_json = pkg_dir / "package.json"
+    if pkg_json.exists():
+        try:
+            with pkg_json.open("r", encoding="utf-8") as f:
+                pkg = json.load(f)
+            # Check for "main" or known JS entry files
+            main = pkg.get("main", "")
+            if main:
+                entry = pkg_dir / main
+                if entry.exists():
+                    return str(entry)
+        except Exception:
+            pass
+
+    # Try common entry point names
+    for name in ("cli.js", "cli.mjs", "index.js", "dist/cli.js", "dist/index.js",
+                 "src/cli.js", "bin/cli.js", "lib/cli.js"):
+        entry = pkg_dir / name
+        if entry.exists():
+            return str(entry)
+
+    return None
+
+
+def _preflight_claude_cmd(cmd: list[str], env: dict[str, str]) -> bool:
+    """Quick test if the claude command can actually execute (catches binary incompatibility)."""
+    test_cmd = cmd[:1] + ["--version"] if "npx" not in cmd[0] else cmd[:3] + ["--version"]
+    try:
+        proc = subprocess.run(
+            test_cmd, capture_output=True, timeout=15, env=env
+        )
+        output = (proc.stdout + proc.stderr).decode(errors="replace").lower()
+        if "not compatible" in output or "is not recognized" in output:
+            return False
+        return proc.returncode == 0
+    except (FileNotFoundError, OSError):
+        return False
+    except Exception:
+        return True
+
+
+def _check_wsl_claude() -> bool:
+    """Check if Claude Code is available inside WSL."""
+    if not IS_WINDOWS:
+        return False
+    if not shutil.which("wsl"):
+        return False
+    try:
+        proc = subprocess.run(
+            ["wsl", "--", "which", "claude"],
+            capture_output=True, timeout=10
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _detect_claude_command(model: str) -> list[str]:
+    """Auto-detect the best way to launch Claude Code on this platform."""
+    system = platform.system()
+
+    if system == "Windows":
+        # On Windows, the native claude.exe may be incompatible.
+        # Priority: JS entry > WSL > npx > claude.cmd
+        js_entry = _find_claude_js_entry()
+        if js_entry:
+            return ["node", js_entry, "--model", model]
+        if _check_wsl_claude():
+            return ["wsl", "--", "claude", "--model", model]
+        npx_cmd = "npx.cmd" if shutil.which("npx.cmd") else ("npx" if shutil.which("npx") else "")
+        if npx_cmd:
+            return [npx_cmd, "-y", "@anthropic-ai/claude-code", "--model", model]
+        if shutil.which("claude.cmd"):
+            return ["claude.cmd", "--model", model]
+    elif system == "Darwin":
+        if shutil.which("claude"):
+            return ["claude", "--model", model]
+        if shutil.which("npx"):
+            return ["npx", "-y", "@anthropic-ai/claude-code", "--model", model]
+    else:
+        if shutil.which("claude"):
+            return ["claude", "--model", model]
+        if shutil.which("npx"):
+            return ["npx", "-y", "@anthropic-ai/claude-code", "--model", model]
+
+    return []
+
+
+def _tunnel_only_mode(local_port: int, gw_token: str, model: str, proc: subprocess.Popen) -> int:
+    """Keep tunnel alive and print instructions for manual connection."""
+    try:
+        from ct_ui import ui
+        ui.tunnel_panel(local_port, gw_token, model,
+                       is_windows=IS_WINDOWS, has_wsl=bool(shutil.which("wsl")))
+    except ImportError:
+        print("\n" + "=" * 60)
+        print("  TUNNEL-ONLY MODE")
+        print("=" * 60)
+        if IS_WINDOWS:
+            print(f'\n  PowerShell:')
+            print(f'    $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:{local_port}"')
+            print(f'    $env:ANTHROPIC_AUTH_TOKEN = "{gw_token}"')
+            print(f'    claude --model {model}')
+        else:
+            print(f'\n  Bash/Zsh:')
+            print(f'    export ANTHROPIC_BASE_URL=http://127.0.0.1:{local_port}')
+            print(f'    export ANTHROPIC_AUTH_TOKEN={gw_token}')
+            print(f'    claude --model {model}')
+        print(f"\n  Press Ctrl+C to stop the tunnel.")
+        print("=" * 60 + "\n")
+
+    _stop_event.clear()
+    old_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, lambda *_: _stop_event.set())
+
+    try:
+        while not _stop_event.is_set():
+            if proc.poll() is not None:
+                print("[!] SSH tunnel process exited unexpectedly.")
+                return 1
+            _stop_event.wait(timeout=1.0)
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
+        print("\n[down] stopping tunnel...")
+        proc.terminate()
+
+    return 0
+
+
 def cmd_a_start(cfg: dict[str, Any]) -> int:
     local_port = cfg["claude"]["local_port"]
     fwd_port = cfg["tunnel"]["forward_port"]
@@ -722,20 +1020,56 @@ def cmd_a_start(cfg: dict[str, Any]) -> int:
     env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{local_port}"
     env["ANTHROPIC_AUTH_TOKEN"] = gw_token
 
-    if platform.system() == "Windows":
-        claude_cmd = ["claude.cmd", "--model", model]
+    # Use configured command, or auto-detect
+    custom_cmd = cfg["claude"].get("command", "")
+    if custom_cmd:
+        if custom_cmd.strip().lower() == "tunnel-only":
+            return _tunnel_only_mode(local_port, gw_token, model, proc)
+        claude_cmd = shlex.split(custom_cmd) + ["--model", model]
     else:
-        claude_cmd = ["claude", "--model", model]
+        claude_cmd = _detect_claude_command(model)
+        if not claude_cmd:
+            print("[!] Claude Code not found, entering tunnel-only mode...")
+            return _tunnel_only_mode(local_port, gw_token, model, proc)
+
+    # Pre-flight check: verify the command actually works
+    print(f"[claude] verifying command: {' '.join(claude_cmd[:3])}...")
+    if not _preflight_claude_cmd(claude_cmd, env):
+        print(f"[!] command failed pre-flight check: {claude_cmd[0]}")
+        # Try fallback: node + JS entry
+        if "node" not in claude_cmd[0]:
+            js_entry = _find_claude_js_entry()
+            if js_entry:
+                claude_cmd = ["node", js_entry, "--model", model]
+                print(f"[!] trying JS entry: node {js_entry}")
+                if not _preflight_claude_cmd(claude_cmd, env):
+                    js_entry = None
+            if not js_entry:
+                # Try WSL
+                if IS_WINDOWS and _check_wsl_claude():
+                    claude_cmd = ["wsl", "--", "claude", "--model", model]
+                    print("[!] trying WSL claude...")
+                    if not _preflight_claude_cmd(claude_cmd, env):
+                        print("[!] WSL claude also failed, entering tunnel-only mode...")
+                        return _tunnel_only_mode(local_port, gw_token, model, proc)
+                else:
+                    print("[!] No working Claude Code found, entering tunnel-only mode...")
+                    return _tunnel_only_mode(local_port, gw_token, model, proc)
 
     print(f"[claude] starting in {project_dir} with model={model}")
+    print(f"[claude] command: {' '.join(claude_cmd)}")
     print(f"[claude] ANTHROPIC_BASE_URL=http://127.0.0.1:{local_port}")
 
     try:
         result = subprocess.run(claude_cmd, cwd=project_dir, env=env)
     except FileNotFoundError:
-        print("[error] 'claude' command not found. Is Claude Code installed?")
-        proc.terminate()
-        return 1
+        print(f"[error] command not found: {claude_cmd[0]}")
+        print("[!] entering tunnel-only mode...")
+        return _tunnel_only_mode(local_port, gw_token, model, proc)
+    except OSError as e:
+        print(f"[error] failed to launch: {e}")
+        print("[!] entering tunnel-only mode...")
+        return _tunnel_only_mode(local_port, gw_token, model, proc)
     except KeyboardInterrupt:
         pass
     finally:
@@ -905,14 +1239,231 @@ class WebHandler(BaseHTTPRequestHandler):
 
 
 def cmd_web(cfg: dict[str, Any], port: int = 8765) -> int:
-    print(f"[web] http://127.0.0.1:{port}")
-    ThreadingHTTPServer(("127.0.0.1", port), WebHandler).serve_forever()
-    return 0
+    """Start web management panel — uses ct_web if available."""
+    try:
+        from ct_web import cmd_web as _web
+        return _web(port)
+    except ImportError:
+        server = None
+        actual_port = port
+        for p in range(port, port + 10):
+            try:
+                server = ThreadingHTTPServer(("127.0.0.1", p), WebHandler)
+                actual_port = p
+                break
+            except OSError:
+                continue
+        if server is None:
+            print(f"[error] Cannot bind to ports {port}-{port+9}")
+            return 1
+        print(f"[web] http://127.0.0.1:{actual_port}")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            server.shutdown()
+        return 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Cleanup
+# Environment check
 # ═══════════════════════════════════════════════════════════════════════════════
+
+IS_MACOS = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
+
+
+def _get_python_version() -> str:
+    return f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+
+def _get_ssh_version() -> tuple[str, tuple[int, int]]:
+    """Return (version_string, (major, minor)) for the system SSH."""
+    import re
+    try:
+        proc = subprocess.run(["ssh", "-V"], capture_output=True, timeout=5)
+        ver_str = (proc.stdout + proc.stderr).decode(errors="replace").strip()
+    except Exception:
+        return ("not found", (0, 0))
+    m = re.search(r"OpenSSH_(\d+)\.(\d+)", ver_str)
+    if m:
+        return (ver_str, (int(m.group(1)), int(m.group(2))))
+    return (ver_str or "unknown", (0, 0))
+
+
+def _check_node() -> tuple[bool, str]:
+    """Check if Node.js is available and return version."""
+    try:
+        proc = subprocess.run(["node", "--version"], capture_output=True, timeout=5)
+        if proc.returncode == 0:
+            return (True, proc.stdout.decode(errors="replace").strip())
+    except Exception:
+        pass
+    return (False, "")
+
+
+def _check_npx() -> bool:
+    return shutil.which("npx") is not None
+
+
+def _check_claude_code() -> tuple[bool, str, str]:
+    """Check Claude Code availability. Returns (available, method, detail)."""
+    system = platform.system()
+
+    if system == "Windows":
+        # Check for JS entry (most reliable on Windows)
+        js_entry = _find_claude_js_entry()
+        if js_entry:
+            return (True, "node", f"node {Path(js_entry).name} (JS entry)")
+        if shutil.which("npx.cmd") or shutil.which("npx"):
+            return (True, "npx", "npx @anthropic-ai/claude-code (binary may be incompatible)")
+        if shutil.which("claude.cmd"):
+            return (True, "native", "claude.cmd (binary may be incompatible)")
+    elif system == "Darwin":
+        if shutil.which("claude"):
+            return (True, "native", shutil.which("claude"))
+        if shutil.which("npx"):
+            return (True, "npx", "npx @anthropic-ai/claude-code")
+    else:
+        if shutil.which("claude"):
+            return (True, "native", shutil.which("claude"))
+        if shutil.which("npx"):
+            return (True, "npx", "npx @anthropic-ai/claude-code")
+
+    return (False, "", "")
+
+
+def _check_ssh_tool() -> tuple[bool, str]:
+    """Check SSH client availability."""
+    if IS_WINDOWS:
+        if _has_plink():
+            return (True, "plink (PuTTY)")
+        if shutil.which("ssh"):
+            return (True, "ssh (Windows OpenSSH)")
+    else:
+        if shutil.which("ssh"):
+            return (True, "ssh")
+    return (False, "")
+
+
+def _check_scp_tool() -> tuple[bool, str]:
+    """Check SCP/file transfer availability."""
+    if HAS_PARAMIKO:
+        return (True, "paramiko SFTP")
+    if IS_WINDOWS and shutil.which("pscp"):
+        return (True, "pscp (PuTTY)")
+    if shutil.which("scp"):
+        return (True, "scp")
+    return (False, "")
+
+
+def cmd_check_env(role: str = "") -> int:
+    """Run full environment dependency check and print results."""
+    try:
+        from ct_ui import ui
+        has_ui = True
+    except ImportError:
+        has_ui = False
+
+    system = platform.system()
+    checks: list[tuple[str, str, str]] = []
+    all_ok = True
+    warnings: list[str] = []
+
+    if has_ui:
+        ui.banner()
+        ui.rule("Environment Check")
+        ui.info(f"Platform: {system} ({platform.machine()})  Python: {_get_python_version()}")
+    else:
+        print(f"\n  === Environment Check ===")
+        print(f"  Platform: {system} ({platform.machine()})  Python: {_get_python_version()}\n")
+
+    # --- SSH ---
+    ssh_ok, ssh_tool = _check_ssh_tool()
+    checks.append(("SSH Client", "ok" if ssh_ok else "fail", ssh_tool or "NOT FOUND"))
+    if not ssh_ok:
+        all_ok = False
+        warnings.append("Install OpenSSH or PuTTY for SSH access")
+
+    ssh_ver_str, ssh_ver = _get_ssh_version()
+    if ssh_ver != (0, 0):
+        ver_display = ssh_ver_str.split(",")[0] if "," in ssh_ver_str else ssh_ver_str
+        checks.append(("SSH Version", "ok", ver_display))
+        if ssh_ver < (8, 4) and not HAS_PARAMIKO:
+            warnings.append(f"OpenSSH {ssh_ver[0]}.{ssh_ver[1]} < 8.4: pip install paramiko for password auth")
+
+    # --- SCP ---
+    scp_ok, scp_tool = _check_scp_tool()
+    checks.append(("File Transfer", "ok" if scp_ok else "fail", scp_tool or "NOT FOUND"))
+    if not scp_ok:
+        all_ok = False
+        warnings.append("Install scp or: pip install paramiko")
+
+    # --- paramiko ---
+    checks.append(("paramiko", "ok" if HAS_PARAMIKO else "warn",
+                   "installed" if HAS_PARAMIKO else "not installed"))
+    if not HAS_PARAMIKO and IS_WINDOWS:
+        warnings.append("pip install paramiko (recommended for Windows)")
+
+    # --- Node.js ---
+    node_ok, node_ver = _check_node()
+    checks.append(("Node.js", "ok" if node_ok else "fail", node_ver or "NOT FOUND"))
+    if not node_ok:
+        all_ok = False
+        warnings.append("Install Node.js: https://nodejs.org/")
+
+    # --- npx ---
+    npx_ok = _check_npx()
+    checks.append(("npx", "ok" if npx_ok else "warn", "available" if npx_ok else "not found"))
+
+    # --- Claude Code ---
+    if role != "c":
+        claude_ok, _, claude_detail = _check_claude_code()
+        checks.append(("Claude Code", "ok" if claude_ok else "fail", claude_detail or "NOT FOUND"))
+        if not claude_ok:
+            all_ok = False
+            warnings.append("npm install -g @anthropic-ai/claude-code")
+
+    # --- WSL ---
+    if IS_WINDOWS and role != "c":
+        wsl_claude = _check_wsl_claude()
+        if wsl_claude:
+            checks.append(("WSL Claude", "ok", "available (fallback)"))
+        elif shutil.which("wsl"):
+            checks.append(("WSL Claude", "warn", "WSL exists, claude not installed"))
+        else:
+            checks.append(("WSL", "warn", "not available"))
+
+        if not _find_claude_js_entry() and not wsl_claude:
+            warnings.append("If binary fails: wsl -- npm install -g @anthropic-ai/claude-code")
+
+    # Display
+    if has_ui:
+        ui.env_table(checks)
+        ui.warnings_panel(warnings)
+        if all_ok and not warnings:
+            ui.success("All checks passed.")
+        elif all_ok:
+            ui.success("Core dependencies OK.")
+        else:
+            ui.error("Some required dependencies are missing.")
+    else:
+        for name, status, detail in checks:
+            icon = {"ok": "[ok]", "warn": "[--]", "fail": "[X] "}.get(status, "[??]")
+            print(f"  {icon} {name:16s} {detail}")
+        if warnings:
+            print("\n  Warnings:")
+            for w in warnings:
+                print(f"    [!] {w}")
+        print()
+        if all_ok:
+            print("  All checks passed." if not warnings else "  Core dependencies OK.")
+        else:
+            print("  Some required dependencies are missing.")
+        print()
+
+    return 0 if all_ok else 1
+
+
 
 
 def _cleanup():
@@ -929,7 +1480,8 @@ def _cleanup():
 
 
 atexit.register(_cleanup)
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+if threading.current_thread() is threading.main_thread():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -939,25 +1491,35 @@ signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
 def main() -> int:
     global CONFIG_PATH
-    # On Windows with password auth, paramiko is required for reliable SSH
-    if IS_WINDOWS and not HAS_PARAMIKO:
-        print("[!] Windows detected: install paramiko for password-based SSH support:")
-        print("    pip install paramiko")
-        print("    (SSH key auth works without paramiko)")
-        print()
 
     parser = argparse.ArgumentParser(
         prog="claude-tunnel",
         description="One-command Claude Code remote tunnel tool.",
     )
     parser.add_argument("command", nargs="?", default="up",
-                        choices=["init", "deploy", "c-start", "a-start", "up", "down", "status", "web"],
+                        choices=["init", "check", "deploy", "c-start", "a-start", "up", "down", "status", "web"],
                         help="Subcommand (default: up)")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="Config file path")
     parser.add_argument("--web-port", type=int, default=8765, help="Web UI port")
+    parser.add_argument("--skip-check", action="store_true", help="Skip environment check")
     args = parser.parse_args()
 
     CONFIG_PATH = args.config
+
+    # Run environment check on init/up/check
+    if args.command in ("init", "check", "up") and not args.skip_check:
+        # Determine role from existing config if available
+        existing_cfg = load_config()
+        role = existing_cfg.get("role", "")
+
+        rc = cmd_check_env(role)
+        if args.command == "check":
+            return rc
+        if rc != 0:
+            answer = input("  Continue anyway? [y/N]: ").strip().lower()
+            if answer not in ("y", "yes"):
+                return 1
+            print()
 
     if args.command == "init":
         cmd_init_interactive()
@@ -983,4 +1545,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")
+        sys.exit(130)

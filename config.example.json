@@ -21,7 +21,8 @@
   "claude": {
     "local_port": 50000,
     "model": "claude-sonnet-4-6",
-    "project_dir": ""
+    "project_dir": "",
+    "command": ""
   },
   "room": {
     "name": "default",
