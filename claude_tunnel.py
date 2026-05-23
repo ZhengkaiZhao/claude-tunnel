@@ -82,6 +82,19 @@ def ensure_config() -> dict[str, Any]:
     return cfg
 
 
+def _load_claude_settings() -> dict[str, str]:
+    """Read ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN from ~/.claude/settings.json."""
+    settings_path = Path.home() / ".claude" / "settings.json"
+    if not settings_path.exists():
+        return {}
+    try:
+        with settings_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("env", {})
+    except Exception:
+        return {}
+
+
 def ask(prompt: str, default: str = "") -> str:
     suffix = f" [{default}]" if default else ""
     val = input(f"  {prompt}{suffix}: ").strip()
@@ -111,10 +124,19 @@ def cmd_init_interactive() -> dict[str, Any]:
 
     if cfg["role"] == "c":
         print("\n  --- Gateway (C-side) ---")
+        # Auto-read from ~/.claude/settings.json; user can override or leave blank
+        claude_env = _load_claude_settings()
+        auto_url = claude_env.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+        auto_token = claude_env.get("ANTHROPIC_AUTH_TOKEN", "")
+        if auto_token:
+            print(f"  [auto] found credentials in ~/.claude/settings.json")
+
         cfg["gateway"]["port"] = int(ask("Local gateway port", "8787"))
         cfg["gateway"]["token"] = ask("Gateway auth token", "change-me")
-        cfg["gateway"]["upstream_base_url"] = ask("Upstream API base URL", "https://api.anthropic.com")
-        cfg["gateway"]["upstream_auth_token"] = ask("Upstream API key/token")
+        cfg["gateway"]["upstream_base_url"] = ask("Upstream API base URL", auto_url)
+        cfg["gateway"]["upstream_auth_token"] = ask("Upstream API key/token (Enter to use local claude settings)", auto_token)
+        # If user left blank, store empty string — c-start will fallback to settings.json at runtime
+
     else:
         print("\n  --- Claude Code (A-side) ---")
         cfg["claude"]["local_port"] = int(ask("Local port for Claude", "50000"))
@@ -617,9 +639,21 @@ def start_heartbeat(cfg: dict[str, Any], role: str) -> None:
 
 def cmd_c_start(cfg: dict[str, Any]) -> int:
     gw = cfg["gateway"]
+
+    # Fill upstream credentials from ~/.claude/settings.json if not in config
     if not gw.get("upstream_base_url") or not gw.get("upstream_auth_token"):
-        print("[error] gateway.upstream_base_url and upstream_auth_token required in config")
+        claude_env = _load_claude_settings()
+        if not gw.get("upstream_base_url"):
+            gw["upstream_base_url"] = claude_env.get("ANTHROPIC_BASE_URL", "")
+        if not gw.get("upstream_auth_token"):
+            gw["upstream_auth_token"] = claude_env.get("ANTHROPIC_AUTH_TOKEN", "")
+
+    if not gw.get("upstream_base_url") or not gw.get("upstream_auth_token"):
+        print("[error] upstream API credentials not found.")
+        print("  Set them in config or in ~/.claude/settings.json (env.ANTHROPIC_BASE_URL / env.ANTHROPIC_AUTH_TOKEN)")
         return 1
+
+    print(f"[gateway] upstream: {gw['upstream_base_url']}")
 
     start_gateway(cfg)
 
