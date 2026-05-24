@@ -85,7 +85,20 @@ def ensure_config() -> dict[str, Any]:
 
 
 def _load_claude_settings() -> dict[str, str]:
-    """Read ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN from ~/.claude/settings.json."""
+    """Read ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN from env vars or ~/.claude/settings.json."""
+    result: dict[str, str] = {}
+
+    # Priority 1: environment variables
+    env_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    env_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+    if env_url:
+        result["ANTHROPIC_BASE_URL"] = env_url
+    if env_token:
+        result["ANTHROPIC_AUTH_TOKEN"] = env_token
+    if result:
+        return result
+
+    # Priority 2: ~/.claude/settings.json
     settings_path = Path.home() / ".claude" / "settings.json"
     if not settings_path.exists():
         return {}
@@ -790,17 +803,23 @@ def start_heartbeat(cfg: dict[str, Any], role: str) -> None:
 def cmd_c_start(cfg: dict[str, Any]) -> int:
     gw = cfg["gateway"]
 
-    # Fill upstream credentials from ~/.claude/settings.json if not in config
+    # Fill upstream credentials from env vars / ~/.claude/settings.json if not in config
     if not gw.get("upstream_base_url") or not gw.get("upstream_auth_token"):
         claude_env = _load_claude_settings()
         if not gw.get("upstream_base_url"):
-            gw["upstream_base_url"] = claude_env.get("ANTHROPIC_BASE_URL", "")
+            gw["upstream_base_url"] = claude_env.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
         if not gw.get("upstream_auth_token"):
-            gw["upstream_auth_token"] = claude_env.get("ANTHROPIC_AUTH_TOKEN", "")
+            gw["upstream_auth_token"] = (
+                claude_env.get("ANTHROPIC_AUTH_TOKEN", "")
+                or claude_env.get("ANTHROPIC_API_KEY", "")
+            )
 
-    if not gw.get("upstream_base_url") or not gw.get("upstream_auth_token"):
-        print("[error] upstream API credentials not found.")
-        print("  Set them in config or in ~/.claude/settings.json (env.ANTHROPIC_BASE_URL / env.ANTHROPIC_AUTH_TOKEN)")
+    if not gw.get("upstream_auth_token"):
+        print("[error] Upstream API key not found.")
+        print("  Options:")
+        print("  1. Run 'python claude_tunnel.py init' and enter your API key at step 14")
+        print("  2. Set environment variable: ANTHROPIC_AUTH_TOKEN=sk-ant-xxx")
+        print("  3. Add to ~/.claude/settings.json: {\"env\": {\"ANTHROPIC_AUTH_TOKEN\": \"sk-ant-xxx\"}}")
         return 1
 
     print(f"[gateway] upstream: {gw['upstream_base_url']}")
