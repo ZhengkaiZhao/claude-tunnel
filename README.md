@@ -72,6 +72,37 @@ python claude_tunnel.py web     # 打开 http://localhost:8765
 
 提供可视化配置、一键启停、实时日志、连接诊断。
 
+## 认证方式
+
+支持两种认证模式：
+
+### API Key 模式（默认）
+
+适用于有 Anthropic API key（`sk-ant-xxx`）的用户。
+
+```bash
+python claude_tunnel.py init
+# auth_type 选择 api_key，填入 API key
+```
+
+### OAuth 账户模式
+
+适用于通过 `claude auth login` 登录 Pro/Max/Team 订阅账户的用户，无需 API key。
+
+**C 端操作：**
+
+```bash
+# 1. 先生成长期 OAuth token（有效期一年）
+claude setup-token
+# 按提示完成浏览器授权，复制输出的 token
+
+# 2. 配置 claude-tunnel
+python claude_tunnel.py init
+# auth_type 选择 oauth_token，粘贴上一步获得的 token
+```
+
+A 端配置不变，正常 `init` + `up` 即可。
+
 ## 命令
 
 | 命令 | 说明 |
@@ -109,8 +140,9 @@ python claude_tunnel.py web     # 打开 http://localhost:8765
   "gateway": {                    // C 端
     "port": 8787,
     "token": "shared-secret",     // A/C 两端必须一致
+    "auth_type": "api_key",       // "api_key" 或 "oauth_token"
     "upstream_base_url": "https://api.anthropic.com",
-    "upstream_auth_token": "sk-ant-xxx"
+    "upstream_auth_token": "sk-ant-xxx"  // OAuth 模式填 setup-token 输出的 token
   },
   "claude": {                     // A 端
     "local_port": 50000,
@@ -178,7 +210,7 @@ pip install -r requirements.txt
 
 ```bash
 # C-side (model server)
-python claude_tunnel.py init   # role=c, VPS info, API key
+python claude_tunnel.py init   # role=c, VPS info, API key or OAuth token
 python claude_tunnel.py up     # deploy relay + gateway + reverse tunnel
 
 # A-side (dev machine)
@@ -187,6 +219,18 @@ python claude_tunnel.py up     # deploy relay + local tunnel + Claude Code
 
 # Web UI
 python claude_tunnel.py web    # http://localhost:8765
+```
+
+### Authentication Modes
+
+**API Key mode** (default): Use your `sk-ant-xxx` API key.
+
+**OAuth token mode**: For Pro/Max/Team subscribers without an API key:
+```bash
+# On C-side, generate a long-lived OAuth token (valid for 1 year)
+claude setup-token
+# Then run init and select auth_type = oauth_token, paste the token
+python claude_tunnel.py init
 ```
 
 ### Requirements

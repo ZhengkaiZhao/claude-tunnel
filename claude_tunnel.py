@@ -48,6 +48,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "host": "127.0.0.1",
         "port": 8787,
         "token": "change-me",
+        "auth_type": "api_key",
         "upstream_base_url": "",
         "upstream_auth_token": "",
     },
@@ -709,7 +710,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                    if k.lower() not in HOP_HEADERS | {"host", "authorization", "x-api-key", "content-length"}}
         headers["host"] = upstream.netloc
         headers["authorization"] = f"Bearer {self.server.upstream_token}"
-        headers["x-api-key"] = self.server.upstream_token
+        if self.server.auth_type != "oauth_token":
+            headers["x-api-key"] = self.server.upstream_token
         if body is not None:
             headers["content-length"] = str(len(body))
 
@@ -754,10 +756,12 @@ def start_gateway(cfg: dict[str, Any]) -> None:
     server.gw_token = gw.get("token", "")
     server.upstream_url = gw["upstream_base_url"].rstrip("/")
     server.upstream_token = gw["upstream_auth_token"]
+    server.auth_type = gw.get("auth_type", "api_key")
     _GATEWAY_SERVER = server
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
-    print(f"[gateway] listening on {gw['host']}:{gw['port']} → {server.upstream_url}")
+    auth_label = "OAuth" if server.auth_type == "oauth_token" else "API key"
+    print(f"[gateway] listening on {gw['host']}:{gw['port']} → {server.upstream_url} ({auth_label})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

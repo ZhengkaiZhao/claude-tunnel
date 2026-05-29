@@ -5,7 +5,9 @@ import json
 import os
 import platform
 import re
+import shutil
 import socket
+import subprocess
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -72,6 +74,48 @@ def validate_choice(choices: List[str]) -> Callable[[str], Tuple[bool, str]]:
     return _validate
 
 
+def _detect_local_oauth_token() -> Optional[str]:
+    """Try to detect an existing OAuth token from the local Claude Code installation."""
+    # Check CLAUDE_CODE_OAUTH_TOKEN env var
+    env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    if env_token:
+        return env_token
+
+    # Try reading ~/.claude/.credentials.json (Linux/Windows)
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    if config_dir:
+        cred_path = Path(config_dir) / ".credentials.json"
+    else:
+        cred_path = Path.home() / ".claude" / ".credentials.json"
+
+    if cred_path.exists():
+        try:
+            with cred_path.open("r", encoding="utf-8") as f:
+                creds = json.load(f)
+            token = creds.get("oauth_token") or creds.get("accessToken") or creds.get("token")
+            if token:
+                return token
+        except Exception:
+            pass
+
+    # Try running 'claude auth status' to check if logged in
+    claude_bin = shutil.which("claude")
+    if claude_bin:
+        try:
+            result = subprocess.run(
+                [claude_bin, "auth", "status"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                if data.get("loggedIn") and data.get("authMethod") == "oauth_token":
+                    return "__OAUTH_LOGGED_IN__"
+        except Exception:
+            pass
+
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Step definitions
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -80,7 +124,7 @@ class Step:
     def __init__(self, key: str, prompt: str, default: str = "",
                  validate: Optional[Callable] = None, secret: bool = False,
                  section: str = "", condition: Optional[Callable] = None,
-                 hint: str = ""):
+                 hint: str = "", choices: Optional[List[Tuple[str, str]]] = None):
         self.key = key
         self.prompt = prompt
         self.default = default
@@ -89,6 +133,7 @@ class Step:
         self.section = section
         self.condition = condition
         self.hint = hint
+        self.choices = choices
 
 
 def _load_claude_settings() -> Dict[str, str]:
@@ -132,6 +177,11 @@ ALL_STEPS = [
          condition=lambda v: v.get("role") == "c"),
     Step("gateway.token", "Gateway auth token", "change-me",
          condition=lambda v: v.get("role") == "c"),
+    Step("gateway.auth_type", "Select authentication type:", "api_key",
+         validate=validate_choice(["api_key", "oauth_token"]),
+         condition=lambda v: v.get("role") == "c",
+         choices=[("api_key", "API Key (sk-ant-xxx)"),
+                  ("oauth_token", "OAuth Token (from 'claude setup-token', for Pro/Max subscribers)")]),
     Step("gateway.upstream_base_url", "Upstream API base URL", "https://api.anthropic.com",
          validate=validate_nonempty,
          condition=lambda v: v.get("role") == "c"),
@@ -161,6 +211,56 @@ ALL_STEPS = [
 # Interactive wizard
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _prompt_choices(step: Step, step_num: int, total: int) -> Optional[str]:
+    """Display numbered choice menu. Returns selected value or None for back."""
+    if hasattr(ui, 'console') and ui.console:
+        ui.console.print(f"  [bold cyan][{step_num}/{total}][/] {step.prompt}")
+        for i, (value, label) in enumerate(step.choices, 1):
+            marker = " *" if value == step.default else ""
+            ui.console.print(f"    [bold]{i}[/]. {label}{marker}")
+        ui.console.print(f"  [dim]Enter number (1-{len(step.choices)}), or 'b' to go back[/]")
+    else:
+        print(f"  [{step_num}/{total}] {step.prompt}")
+        for i, (value, label) in enumerate(step.choices, 1):
+            marker = " *" if value == step.default else ""
+            print(f"    {i}. {label}{marker}")
+        print(f"  Enter number (1-{len(step.choices)}), or 'b' to go back")
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            if hasattr(ui, 'console') and ui.console:
+                from rich.prompt import Prompt
+                raw = Prompt.ask(f"  [bold cyan]>[/]", default=None)
+            else:
+                raw = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if not raw:
+            if step.default:
+                return step.default
+            continue
+
+        if raw.lower() in ("b", "<", "back"):
+            return None
+
+        try:
+            idx = int(raw)
+            if 1 <= idx <= len(step.choices):
+                return step.choices[idx - 1][0]
+        except ValueError:
+            pass
+
+        ui.error(f"Please enter a number between 1 and {len(step.choices)}")
+        if attempt >= max_retries - 1:
+            ui.warn("Too many invalid attempts, going back.")
+            return None
+
+    return None
+
+
 def _prompt_one(step: Step, step_num: int, total: int, values: Dict[str, str]) -> Optional[str]:
     """Prompt for one step. Returns value or None if user wants to go back."""
     # Section header
@@ -174,6 +274,10 @@ def _prompt_one(step: Step, step_num: int, total: int, values: Dict[str, str]) -
         else:
             print(f"        {step.hint}")
 
+    # Numbered choice menu
+    if step.choices:
+        return _prompt_choices(step, step_num, total)
+
     # Retry loop for validation (not recursive)
     max_retries = 5
     for attempt in range(max_retries):
@@ -183,6 +287,10 @@ def _prompt_one(step: Step, step_num: int, total: int, values: Dict[str, str]) -
                 display_default = step.default
                 if display_default == "__LOCAL__":
                     display_default = "auto (local)"
+                elif display_default == "__OAUTH_LOCAL__":
+                    display_default = "auto (detected OAuth token)"
+                elif display_default == "__OAUTH_GENERATE__":
+                    display_default = "auto (run setup-token)"
                 default_val = display_default if display_default else None
                 raw = Prompt.ask(
                     f"  [bold cyan][{step_num}/{total}][/] {step.prompt}",
@@ -190,12 +298,16 @@ def _prompt_one(step: Step, step_num: int, total: int, values: Dict[str, str]) -
                     password=step.secret
                 )
                 value = raw.strip() if raw else ""
-                if value == "auto (local)":
+                if value in ("auto (local)", "auto (detected OAuth token)", "auto (run setup-token)"):
                     value = step.default
             else:
                 display_default = step.default
                 if display_default == "__LOCAL__":
                     display_default = "auto (local)"
+                elif display_default == "__OAUTH_LOCAL__":
+                    display_default = "auto (detected OAuth token)"
+                elif display_default == "__OAUTH_GENERATE__":
+                    display_default = "auto (run setup-token)"
                 default_display = "***" if step.secret and display_default else display_default
                 suffix = f" [{default_display}]" if display_default else ""
                 value = input(f"  [{step_num}/{total}] {step.prompt}{suffix}: ").strip()
@@ -291,17 +403,48 @@ def cmd_init_interactive() -> Dict[str, Any]:
                 step.default = "https://api.anthropic.com"
 
         if step.key == "gateway.upstream_auth_token":
-            env = _load_claude_settings()
-            local_token = env.get("ANTHROPIC_AUTH_TOKEN", "")
-            if local_token and not values.get("_upstream_token_set"):
-                masked = local_token[:8] + "..." if len(local_token) > 8 else "***"
-                if hasattr(ui, 'console') and ui.console:
-                    ui.console.print(f"  [dim]Detected in ~/.claude/settings.json:[/] [cyan]{masked}[/]")
-                    ui.console.print(f"  [dim]Press Enter to use it, or type a custom key[/]")
+            is_oauth = values.get("gateway.auth_type") == "oauth_token"
+            if is_oauth:
+                detected_token = _detect_local_oauth_token()
+                if detected_token and detected_token != "__OAUTH_LOGGED_IN__":
+                    masked = detected_token[:12] + "..." if len(detected_token) > 12 else "***"
+                    if hasattr(ui, 'console') and ui.console:
+                        ui.console.print(f"  [dim]Detected local OAuth token:[/] [cyan]{masked}[/]")
+                        ui.console.print(f"  [dim]Press Enter to use it, or paste a different token[/]")
+                    else:
+                        print(f"        Detected local OAuth token: {masked}")
+                        print(f"        Press Enter to use it, or paste a different token")
+                    step.default = "__OAUTH_LOCAL__"
+                    step._detected_oauth = detected_token
+                elif detected_token == "__OAUTH_LOGGED_IN__":
+                    if hasattr(ui, 'console') and ui.console:
+                        ui.console.print(f"  [bold green]✓[/] [dim]Claude Code is logged in via OAuth on this machine.[/]")
+                        ui.console.print(f"  [dim]Run [bold]claude setup-token[/bold] to generate a shareable token, then paste it below.[/]")
+                        ui.console.print(f"  [dim]Or press Enter to run it automatically.[/]")
+                    else:
+                        print("        ✓ Claude Code is logged in via OAuth on this machine.")
+                        print("        Run 'claude setup-token' to generate a shareable token, then paste it below.")
+                        print("        Or press Enter to run it automatically.")
+                    step.default = "__OAUTH_GENERATE__"
                 else:
-                    print(f"        Detected: {masked}")
-                    print(f"        Press Enter to use it, or type a custom key")
-                step.default = "__LOCAL__"
+                    if hasattr(ui, 'console') and ui.console:
+                        ui.console.print(f"  [dim]Run [bold]claude setup-token[/bold] on this machine to get a long-lived OAuth token.[/]")
+                        ui.console.print(f"  [dim]Paste the token below:[/]")
+                    else:
+                        print("        Run 'claude setup-token' to get a long-lived OAuth token.")
+                        print("        Paste the token below:")
+            else:
+                env = _load_claude_settings()
+                local_token = env.get("ANTHROPIC_AUTH_TOKEN", "")
+                if local_token and not values.get("_upstream_token_set"):
+                    masked = local_token[:8] + "..." if len(local_token) > 8 else "***"
+                    if hasattr(ui, 'console') and ui.console:
+                        ui.console.print(f"  [dim]Detected in ~/.claude/settings.json:[/] [cyan]{masked}[/]")
+                        ui.console.print(f"  [dim]Press Enter to use it, or type a custom key[/]")
+                    else:
+                        print(f"        Detected: {masked}")
+                        print(f"        Press Enter to use it, or type a custom key")
+                    step.default = "__LOCAL__"
 
         result = _prompt_one(step, current + 1, total, values)
 
@@ -333,4 +476,53 @@ def cmd_init_interactive() -> Dict[str, Any]:
         env = _load_claude_settings()
         cfg["gateway"]["upstream_auth_token"] = env.get("ANTHROPIC_AUTH_TOKEN", "")
 
+    # Handle OAuth token special values
+    gw_token = cfg.get("gateway", {}).get("upstream_auth_token", "")
+    if gw_token == "__OAUTH_LOCAL__":
+        detected = _detect_local_oauth_token()
+        if detected and detected != "__OAUTH_LOGGED_IN__":
+            cfg["gateway"]["upstream_auth_token"] = detected
+        else:
+            cfg["gateway"]["upstream_auth_token"] = ""
+    elif gw_token == "__OAUTH_GENERATE__":
+        cfg["gateway"]["upstream_auth_token"] = _run_setup_token()
+
     return cfg
+
+
+def _run_setup_token() -> str:
+    """Run 'claude setup-token' and capture the generated token."""
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        ui.error("Claude Code CLI not found. Please run 'claude setup-token' manually.")
+        return ""
+
+    if hasattr(ui, 'console') and ui.console:
+        ui.console.print(f"\n  [bold]Running 'claude setup-token'...[/]")
+        ui.console.print(f"  [dim]This will open a browser for OAuth authorization.[/]\n")
+    else:
+        print("\n  Running 'claude setup-token'...")
+        print("  This will open a browser for OAuth authorization.\n")
+
+    try:
+        result = subprocess.run(
+            [claude_bin, "setup-token"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            token = result.stdout.strip()
+            masked = token[:12] + "..." if len(token) > 12 else "***"
+            if hasattr(ui, 'console') and ui.console:
+                ui.console.print(f"  [bold green]✓[/] Token generated: [cyan]{masked}[/]")
+            else:
+                print(f"  ✓ Token generated: {masked}")
+            return token
+        else:
+            ui.error(f"setup-token failed: {result.stderr.strip() or 'no output'}")
+            return ""
+    except subprocess.TimeoutExpired:
+        ui.error("setup-token timed out (120s). Please run it manually.")
+        return ""
+    except Exception as e:
+        ui.error(f"Failed to run setup-token: {e}")
+        return ""
